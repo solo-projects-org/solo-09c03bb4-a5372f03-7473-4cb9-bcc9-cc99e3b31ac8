@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: wetland-handover:local
+    ports:
+      - "8000:8000"
+    environment:
+      HANDOVER_DB: /data/handover.db
+    volumes:
+      - track_data:/data
+    restart: unless-stopped
+
+volumes:
+  track_data:
