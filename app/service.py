@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from fractions import Fraction
@@ -19,6 +20,8 @@ from .schemas import (
     Zone,
     ZoneOut,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ApiError(Exception):
@@ -46,7 +49,7 @@ class TrailRecord:
     def n(self) -> int:
         return len(self.samples)
 
-    def geometry(self) -> TrailGeometry:
+    def geometry(self, verdicts: "VerdictStore | None" = None) -> TrailGeometry:
         return TrailGeometry(
             times=[s.t for s in self.samples],
             xs=[s.x for s in self.samples],
@@ -55,7 +58,32 @@ class TrailRecord:
                 (z.x_min, z.x_max, z.y_min, z.y_max) for z in self.zones
             ],
             error_limit=Fraction(self.error_limit),
+            verdicts=verdicts,
         )
+
+
+class VerdictStore:
+    """Per-trail chord verdicts: the in-memory view plus this run's new ones.
+
+    Reads come from the durable set loaded at request start; ``put`` records a
+    freshly computed verdict and buffers it so it can be flushed even when the
+    surrounding issuance transaction is rolled back (point-limit overflow).
+    """
+
+    def __init__(
+        self, trail_id: str, known: dict[tuple[int, int], bool] | None = None
+    ) -> None:
+        self.trail_id = trail_id
+        self._known: dict[tuple[int, int], bool] = dict(known or {})
+        self.pending: dict[tuple[int, int], bool] = {}
+
+    def get(self, a: int, b: int) -> bool | None:
+        return self._known.get((a, b))
+
+    def put(self, a: int, b: int, valid: bool) -> None:
+        if (a, b) not in self._known:
+            self._known[(a, b)] = valid
+            self.pending[(a, b)] = valid
 
 
 def _row_to_trail(row: sqlite3.Row) -> TrailRecord:
@@ -125,8 +153,68 @@ class Service:
     def _used(rows: list[sqlite3.Row]) -> int:
         return rows[-1]["total_points_used"] if rows else 0
 
-    def _summary(self, trail: TrailRecord, rows: list[sqlite3.Row]) -> TrailSummary:
-        geom = trail.geometry()
+    @staticmethod
+    def _load_all_verdicts(
+        conn: sqlite3.Connection,
+    ) -> dict[str, dict[tuple[int, int], bool]]:
+        rows = conn.execute(
+            "SELECT trail_id, a, b, valid FROM edge_verdicts"
+        ).fetchall()
+        grouped: dict[str, dict[tuple[int, int], bool]] = {}
+        for row in rows:
+            grouped.setdefault(row["trail_id"], {})[(row["a"], row["b"])] = bool(
+                row["valid"]
+            )
+        return grouped
+
+    @staticmethod
+    def _load_verdicts(
+        conn: sqlite3.Connection, trail_id: str
+    ) -> dict[tuple[int, int], bool]:
+        rows = conn.execute(
+            "SELECT a, b, valid FROM edge_verdicts WHERE trail_id = ?", (trail_id,)
+        ).fetchall()
+        return {(row["a"], row["b"]): bool(row["valid"]) for row in rows}
+
+    def _flush_verdicts(
+        self, trail_id: str, verdicts: dict[tuple[int, int], bool]
+    ) -> None:
+        """Persist freshly computed verdicts in their own transaction.
+
+        Called after the issuance transaction has committed or rolled back, so
+        an over-budget rejection still leaves this run's verdicts reusable and
+        the write lock is never taken twice at once.
+
+        Caching is an optimisation: a failed flush only costs a later
+        recomputation, so it never turns an issued segment into an error.
+        """
+        if not verdicts:
+            return
+        try:
+            with self.db.write_transaction() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO edge_verdicts (trail_id, a, b, valid)"
+                    " VALUES (?, ?, ?, ?)",
+                    [
+                        (trail_id, a, b, 1 if valid else 0)
+                        for (a, b), valid in verdicts.items()
+                    ],
+                )
+        except sqlite3.Error:
+            logger.warning(
+                "could not persist %d edge verdicts for trail %s",
+                len(verdicts),
+                trail_id,
+                exc_info=True,
+            )
+
+    def _summary(
+        self,
+        trail: TrailRecord,
+        rows: list[sqlite3.Row],
+        verdicts: VerdictStore | None = None,
+    ) -> TrailSummary:
+        geom = trail.geometry(verdicts)
         progress = self._progress(rows)
         used = self._used(rows)
         remaining_min = geom.minimum_points(progress, trail.n - 1)
@@ -155,16 +243,30 @@ class Service:
             rows = conn.execute(
                 "SELECT * FROM trails ORDER BY created_at, id"
             ).fetchall()
-            return [
-                self._summary(_row_to_trail(row), self._segments(conn, row["id"]))
-                for row in rows
-            ]
+            known = self._load_all_verdicts(conn)
+            summaries = []
+            pending: list[tuple[str, dict[tuple[int, int], bool]]] = []
+            for row in rows:
+                trail = _row_to_trail(row)
+                verdicts = VerdictStore(trail.id, known.get(trail.id))
+                summaries.append(
+                    self._summary(trail, self._segments(conn, trail.id), verdicts)
+                )
+                pending.append((trail.id, verdicts.pending))
+        for trail_id, new_verdicts in pending:
+            self._flush_verdicts(trail_id, new_verdicts)
+        return summaries
 
     def get_detail(self, trail_id: str) -> TrailDetail:
         with self.db.connect() as conn:
             trail = self._load_trail(conn, trail_id)
             rows = self._segments(conn, trail_id)
-            summary = self._summary(trail, rows)
+            verdicts = VerdictStore(
+                trail_id, self._load_verdicts(conn, trail_id)
+            )
+            summary = self._summary(trail, rows, verdicts)
+        # Backfill any verdicts this read had to compute (old databases).
+        self._flush_verdicts(trail_id, verdicts.pending)
         return TrailDetail(
             **summary.model_dump(),
             samples=[
@@ -221,113 +323,129 @@ class Service:
         end_index: int,
         required_pins: list[int],
     ) -> SegmentOut:
-        with self.db.write_transaction() as conn:
-            trail = self._load_trail(conn, trail_id)
-            rows = self._segments(conn, trail_id)
-            progress = self._progress(rows)
-            used = self._used(rows)
+        verdicts: VerdictStore | None = None
+        try:
+            with self.db.write_transaction() as conn:
+                trail = self._load_trail(conn, trail_id)
+                rows = self._segments(conn, trail_id)
+                progress = self._progress(rows)
+                used = self._used(rows)
 
-            if observed_progress != progress:
-                raise ApiError(
-                    409,
-                    "stale_progress",
-                    f"所见进度 {observed_progress} 已过期，当前进度为 {progress}；"
-                    "请重新拉取已签发段后再提交。",
-                    trail_id=trail_id,
-                    current_progress=progress,
+                if observed_progress != progress:
+                    raise ApiError(
+                        409,
+                        "stale_progress",
+                        f"所见进度 {observed_progress} 已过期，当前进度为 {progress}；"
+                        "请重新拉取已签发段后再提交。",
+                        trail_id=trail_id,
+                        current_progress=progress,
+                    )
+                if progress >= trail.n - 1:
+                    raise ApiError(
+                        409,
+                        "trail_complete",
+                        "整条轨迹已全部签发，没有下一段。",
+                        trail_id=trail_id,
+                        current_progress=progress,
+                    )
+                if not (progress < end_index <= trail.n - 1):
+                    raise ApiError(
+                        422,
+                        "invalid_end_index",
+                        f"终点必须满足 {progress} < end_index <= {trail.n - 1}",
+                        trail_id=trail_id,
+                        current_progress=progress,
+                    )
+
+                pins = sorted(set(required_pins))
+                outside = [p for p in pins if not (progress <= p <= end_index)]
+                if outside:
+                    raise ApiError(
+                        422,
+                        "pin_outside_segment",
+                        f"复核点 {outside} 不在本段 [{progress}, {end_index}] 内",
+                        trail_id=trail_id,
+                        current_progress=progress,
+                    )
+
+                # Only the chords this request actually needs are consulted or
+                # computed: the current segment (through the pins), then the
+                # remainder from this end to the trail end.  Both the detail
+                # view and this API share the durable verdict set.
+                verdicts = VerdictStore(
+                    trail_id, self._load_verdicts(conn, trail_id)
                 )
-            if progress >= trail.n - 1:
-                raise ApiError(
-                    409,
-                    "trail_complete",
-                    "整条轨迹已全部签发，没有下一段。",
-                    trail_id=trail_id,
-                    current_progress=progress,
+                geom = trail.geometry(verdicts)
+                chain = chain_via_pins(geom, progress, end_index, pins)
+
+                remaining_min = geom.minimum_points(end_index, trail.n - 1)
+                assert remaining_min is not None
+                segment_min = len(chain)
+                new_points = segment_min if not rows else segment_min - 1
+                total_after = used + new_points
+                remaining_new = remaining_min - 1
+                minimum_total = total_after + remaining_new
+
+                if minimum_total > trail.point_limit:
+                    raise ApiError(
+                        409,
+                        "point_limit_exceeded",
+                        "按本次选择完成整条轨迹至少需要 "
+                        f"{minimum_total} 个点，超过全程点数上限 {trail.point_limit}；"
+                        "进度未改变。",
+                        trail_id=trail_id,
+                        current_progress=progress,
+                        point_limit=trail.point_limit,
+                        issued_point_count=used,
+                        segment_minimum_points=segment_min,
+                        remaining_minimum_points=remaining_min,
+                        minimum_total_points=minimum_total,
+                    )
+
+                seq = len(rows) + 1
+                created = utcnow()
+                point_payload = [
+                    {
+                        "index": i,
+                        "t": trail.samples[i].t,
+                        "x": trail.samples[i].x,
+                        "y": trail.samples[i].y,
+                    }
+                    for i in chain
+                ]
+                conn.execute(
+                    "INSERT INTO segments (trail_id, seq, start_index, end_index,"
+                    " observed_progress, required_pins, points, point_count,"
+                    " new_point_count, total_points_used, remaining_minimum_points,"
+                    " remaining_new_points, minimum_total_points, point_limit,"
+                    " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        trail_id,
+                        seq,
+                        progress,
+                        end_index,
+                        observed_progress,
+                        encode(pins),
+                        encode(point_payload),
+                        segment_min,
+                        new_points,
+                        total_after,
+                        remaining_min,
+                        remaining_new,
+                        minimum_total,
+                        trail.point_limit,
+                        created,
+                    ),
                 )
-            if not (progress < end_index <= trail.n - 1):
-                raise ApiError(
-                    422,
-                    "invalid_end_index",
-                    f"终点必须满足 {progress} < end_index <= {trail.n - 1}",
-                    trail_id=trail_id,
-                    current_progress=progress,
-                )
-
-            pins = sorted(set(required_pins))
-            outside = [p for p in pins if not (progress <= p <= end_index)]
-            if outside:
-                raise ApiError(
-                    422,
-                    "pin_outside_segment",
-                    f"复核点 {outside} 不在本段 [{progress}, {end_index}] 内",
-                    trail_id=trail_id,
-                    current_progress=progress,
-                )
-
-            geom = trail.geometry()
-            chain = chain_via_pins(geom, progress, end_index, pins)
-
-            remaining_min = geom.minimum_points(end_index, trail.n - 1)
-            assert remaining_min is not None
-            segment_min = len(chain)
-            new_points = segment_min if not rows else segment_min - 1
-            total_after = used + new_points
-            remaining_new = remaining_min - 1
-            minimum_total = total_after + remaining_new
-
-            if minimum_total > trail.point_limit:
-                raise ApiError(
-                    409,
-                    "point_limit_exceeded",
-                    "按本次选择完成整条轨迹至少需要 "
-                    f"{minimum_total} 个点，超过全程点数上限 {trail.point_limit}；"
-                    "进度未改变。",
-                    trail_id=trail_id,
-                    current_progress=progress,
-                    point_limit=trail.point_limit,
-                    issued_point_count=used,
-                    segment_minimum_points=segment_min,
-                    remaining_minimum_points=remaining_min,
-                    minimum_total_points=minimum_total,
-                )
-
-            seq = len(rows) + 1
-            created = utcnow()
-            point_payload = [
-                {
-                    "index": i,
-                    "t": trail.samples[i].t,
-                    "x": trail.samples[i].x,
-                    "y": trail.samples[i].y,
-                }
-                for i in chain
-            ]
-            conn.execute(
-                "INSERT INTO segments (trail_id, seq, start_index, end_index,"
-                " observed_progress, required_pins, points, point_count,"
-                " new_point_count, total_points_used, remaining_minimum_points,"
-                " remaining_new_points, minimum_total_points, point_limit,"
-                " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    trail_id,
-                    seq,
-                    progress,
-                    end_index,
-                    observed_progress,
-                    encode(pins),
-                    encode(point_payload),
-                    segment_min,
-                    new_points,
-                    total_after,
-                    remaining_min,
-                    remaining_new,
-                    minimum_total,
-                    trail.point_limit,
-                    created,
-                ),
-            )
-            row = conn.execute(
-                "SELECT * FROM segments WHERE trail_id = ? AND seq = ?",
-                (trail_id, seq),
-            ).fetchone()
-            return _row_to_segment(row)
+                row = conn.execute(
+                    "SELECT * FROM segments WHERE trail_id = ? AND seq = ?",
+                    (trail_id, seq),
+                ).fetchone()
+                result = _row_to_segment(row)
+        finally:
+            # Verdicts computed during this attempt survive both a committed
+            # issuance and an over-budget rejection; they are never computed
+            # again, in this process or after a restart.
+            if verdicts is not None:
+                self._flush_verdicts(trail_id, verdicts.pending)
+        return result

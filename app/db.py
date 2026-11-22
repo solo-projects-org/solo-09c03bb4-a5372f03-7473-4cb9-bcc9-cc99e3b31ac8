@@ -27,6 +27,17 @@ CREATE TABLE IF NOT EXISTS trails (
     zones       TEXT NOT NULL
 );
 
+-- Durable verdicts for "can samples a and b be joined by one straight chord?".
+-- Both True and False verdicts are stored: a rejected chord stays rejected
+-- across restarts, and an old database is backfilled lazily on demand.
+CREATE TABLE IF NOT EXISTS edge_verdicts (
+    trail_id    TEXT NOT NULL REFERENCES trails(id),
+    a           INTEGER NOT NULL,
+    b           INTEGER NOT NULL,
+    valid       INTEGER NOT NULL CHECK (valid IN (0, 1)),
+    PRIMARY KEY (trail_id, a, b)
+);
+
 CREATE TABLE IF NOT EXISTS segments (
     trail_id             TEXT NOT NULL REFERENCES trails(id),
     seq                  INTEGER NOT NULL,

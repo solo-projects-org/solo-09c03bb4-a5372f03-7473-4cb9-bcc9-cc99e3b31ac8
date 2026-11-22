@@ -19,14 +19,29 @@ Model
 A chord between two selected samples only affects the time span between them,
 so both constraints decompose over the ``gap`` between consecutive selected
 points; :meth:`TrailGeometry.edge_valid` therefore only inspects one gap.
+
+Edge verdicts (both connectable and non-connectable) can be supplied through a
+:class:`VerdictStore`.  Whenever a verdict is already known, neither the error
+check nor the dwell machinery runs; in particular the original track's dwell
+components are built lazily, only for chords that still need checking.
 """
 
 from __future__ import annotations
 
 import bisect
 from fractions import Fraction
+from typing import Protocol
 
 Rect = tuple[int, int, int, int]  # x_min, x_max, y_min, y_max (open rectangle)
+
+
+class VerdictStore(Protocol):
+    """Durable edge verdicts shared by the detail view and the issuance API."""
+
+    def get(self, a: int, b: int) -> bool | None: ...
+
+    def put(self, a: int, b: int, valid: bool) -> None: ...
+
 
 # A component of the "inside" time set.  The set is open (the rectangle
 # boundary is excluded), so both ends are open; the two boolean flags only
@@ -45,6 +60,7 @@ class TrailGeometry:
         ys: list[int],
         rects: list[Rect],
         error_limit: Fraction,
+        verdicts: VerdictStore | None = None,
     ) -> None:
         if not (len(times) == len(xs) == len(ys)):
             raise ValueError("times, xs and ys must have the same length")
@@ -58,17 +74,35 @@ class TrailGeometry:
         self.error_limit = error_limit
         self.err_num = error_limit.numerator
         self.err_den = error_limit.denominator
+        self.verdicts = verdicts
 
-        # Global inside-time components of the original curve, per zone.
-        self.components: list[list[tuple[Fraction, Fraction]]] = [
-            self._build_components(rect) for rect in rects
-        ]
-        self.component_ends: list[list[Fraction]] = [
-            [hi for _lo, hi in comps] for comps in self.components
-        ]
+        # Global inside-time components of the original curve, per zone.  These
+        # are only needed by ``_dwell_ok``; building them lazily lets a request
+        # that is fully answered by stored verdicts skip the reconstruction.
+        self._zone_cache: list[
+            tuple[list[tuple[Fraction, Fraction]], list[Fraction]] | None
+        ] = [None] * len(rects)
 
         self._edge_cache: dict[tuple[int, int], bool] = {}
         self._chain_cache: dict[tuple[int, int], list[int] | None] = {}
+
+    def _zone_data(
+        self, zone: int
+    ) -> tuple[list[tuple[Fraction, Fraction]], list[Fraction]]:
+        cached = self._zone_cache[zone]
+        if cached is None:
+            comps = self._build_components(self.rects[zone])
+            cached = (comps, [hi for _lo, hi in comps])
+            self._zone_cache[zone] = cached
+        return cached
+
+    @property
+    def components(self) -> list[list[tuple[Fraction, Fraction]]]:
+        return [self._zone_data(z)[0] for z in range(len(self.rects))]
+
+    @property
+    def component_ends(self) -> list[list[Fraction]]:
+        return [self._zone_data(z)[1] for z in range(len(self.rects))]
 
     # ------------------------------------------------------------------ #
     # Interval primitives
@@ -173,10 +207,9 @@ class TrailGeometry:
         self, zone: int, ta: Fraction, tb: Fraction
     ) -> list[tuple[Fraction, Fraction]]:
         """Original inside-set restricted to the open gap ``(ta, tb)``."""
-        comps = self.components[zone]
+        comps, ends = self._zone_data(zone)
         if not comps:
             return []
-        ends = self.component_ends[zone]
         j = bisect.bisect_right(ends, ta)
         clipped: list[tuple[Fraction, Fraction]] = []
         while j < len(comps) and comps[j][0] < tb:
@@ -246,8 +279,14 @@ class TrailGeometry:
             # The chord is exactly the original piece: zero error, same dwell.
             self._edge_cache[key] = True
             return True
+        stored = self.verdicts.get(a, b) if self.verdicts is not None else None
+        if stored is not None:
+            self._edge_cache[key] = stored
+            return stored
         ok = self._error_ok(a, b) and self._dwell_ok(a, b)
         self._edge_cache[key] = ok
+        if self.verdicts is not None:
+            self.verdicts.put(a, b, ok)
         return ok
 
     # ------------------------------------------------------------------ #
